@@ -1,0 +1,52 @@
+stages:
+  - test        # SAST
+  - validate    # AWS validation
+  - deploy      # Ansible deploy
+
+.authenticated:
+  id_tokens:
+    AWS_OIDC_TOKEN:
+      aud: https://amazonaws.com
+  variables:
+    AWS_PROFILE: oidc
+    AWS_CONFIG_FILE: ${AWS_CONFIG_FILE_PATH}  # Safe generic name
+
+validate_aws_auth:
+  stage: validate
+  image: amazon/aws-cli  # Public image
+  entrypoint: [""]
+  extends:
+    - .authenticated
+  script:
+    - echo "AWS CLI Version:"
+    - aws --version
+    - echo "Validating AWS OIDC access..."
+    - aws sts get-caller-identity
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "prod"'
+      when: always
+
+run_ansible_deploy:
+  stage: deploy
+  image: python:3.12-slim  # Public image
+  extends:
+    - .authenticated
+  before_script:
+    - pip install -r requirements.txt
+    - ansible-galaxy collection install -r requirements.yml
+  script:
+    - echo "Running Ansible deploy role..."
+    - ansible-playbook deploy.role.yml  # Generic filename
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "prod"'
+      when: manual
+  artifacts:
+    paths:
+      - roles/output/
+    untracked: false
+    when: on_success
+    access: all
+    expire_in: 30 days
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
