@@ -1,0 +1,145 @@
+# SPDX-License-Identifier: MIT
+# Author: Wes Dean
+# Description: Ansible playbook to deploy and configure Meraki networks, VLANs, and site-to-site VPN.
+# Notes:
+# - Inject secrets via environment variables (e.g., MERAKI_API_KEY, MERAKI_BASE_URL)
+# - Customize vars/globalvars.yml and sitevars.yml to match your target sites
+
+- name: Include global variables
+  include_vars: globalvars.yml
+
+- name: Include site-specific variables
+  include_vars: sitevars.yml
+
+# ===============================
+# === Create Meraki Networks ===
+# ===============================
+
+- name: Create Meraki Network Sites
+  cisco.meraki.networks:
+    organizationId: "{{ org_id }}"
+    meraki_api_key: "{{ lookup('env', 'MERAKI_API_KEY') }}"
+    meraki_base_url: "{{ lookup('env', 'MERAKI_BASE_URL') | default('https://api.meraki.com/api/v1') }}"
+    meraki_maximum_retries: 3
+    meraki_wait_on_rate_limit: true
+    state: present
+    name: "{{ item.name }}"
+    productTypes: ["appliance", "switch", "wireless"]
+    tags: ["network", "{{ item.region }}", "{{ item.site_abbr }}"]
+    timeZone: "UTC"
+    notes: "Configured via Ansible on {{ ansible_date_time.iso8601 }}"
+  loop: "{{ networks }}"
+  register: created_networks
+
+- name: Capture created network info
+  set_fact:
+    network_info: "{{ network_info | default([]) + [{'name': item.meraki_response.name, 'id': item.meraki_response.id, 'octet': item.item.octet, 'mode': item.item.mode, 'offset': item.item.offset, 'hub_id': item.item.hub_id}] }}"
+  loop: "{{ created_networks.results }}"
+
+- name: Generate output filename
+  set_fact:
+    output_filename: "network_info_{{ ansible_date_time.year }}{{ ansible_date_time.day }}{{ ansible_date_time.month }}_{{ ansible_date_time.hour }}{{ ansible_date_time.minute }}.json"
+
+- name: Save network_info as JSON
+  copy:
+    content: "{{ network_info | to_nice_json }}"
+    dest: "output/{{ output_filename }}"
+
+# ============================
+# === Configure Networks ====
+# ============================
+
+- name: Configure network settings
+  cisco.meraki.networks_settings:
+    networkId: "{{ item.id }}"
+    meraki_api_key: "{{ lookup('env', 'MERAKI_API_KEY') }}"
+    meraki_base_url: "{{ lookup('env', 'MERAKI_BASE_URL') }}"
+    state: present
+    localStatusPageEnabled: false
+    remoteStatusPageEnabled: true
+    securePort:
+      enabled: false
+  loop: "{{ network_info }}"
+
+- name: Enable VLANs
+  cisco.meraki.networks_appliance_vlans_settings:
+    networkId: "{{ item.id }}"
+    meraki_api_key: "{{ lookup('env', 'MERAKI_API_KEY') }}"
+    meraki_base_url: "{{ lookup('env', 'MERAKI_BASE_URL') }}"
+    state: present
+    vlansEnabled: true
+  loop: "{{ network_info }}"
+
+# ========================
+# === VLAN Deployment ===
+# ========================
+
+- name: Create VLANs
+  cisco.meraki.networks_appliance_vlans:
+    meraki_api_key: "{{ lookup('env', 'MERAKI_API_KEY') }}"
+    meraki_base_url: "{{ lookup('env', 'MERAKI_BASE_URL') }}"
+    state: present
+    networkId: "{{ item.id }}"
+    id: "{{ vlan.vlan_id }}"
+    name: "{{ vlan.vlan_name }}"
+    subnet: "{{ vlan.vlan_subnet }}"
+    applianceIp: "{{ vlan.vlan_ip }}"
+  loop: "{{ network_info | subelements('vlans') }}"
+  vars:
+    vlan_definitions:
+      - { vlan_id: 22, name: "Management", offset: 23 }
+      - { vlan_id: 47, name: "Application", offset: 42 }
+      - { vlan_id: 61, name: "Operations", offset: 35 }
+      - { vlan_id: 78, name: "Devices", offset: 29 }
+      - { vlan_id: 89, name: "General", offset: 53 }
+      - { vlan_id: 94, name: "DMZ", offset: 60 }
+    vlans: >
+      [{% for v in vlan_definitions %}
+        {
+          "vlan_id": {{ v.vlan_id }},
+          "vlan_name": "{{ v.name }}",
+          "vlan_subnet": "10.{{ item.octet }}.{{ v.offset + (item.offset | int) }}.0/24",
+          "vlan_ip": "10.{{ item.octet }}.{{ v.offset + (item.offset | int) }}.1"
+        }{% if not loop.last %},{% endif %}
+      {% endfor %}]
+
+# ==========================
+# === Site-to-Site VPN ====
+# ==========================
+
+- name: Configure Site-to-Site VPN
+  cisco.meraki.networks_appliance_vpn_site_to_site_vpn:
+    networkId: "{{ item.id }}"
+    meraki_api_key: "{{ lookup('env', 'MERAKI_API_KEY') }}"
+    meraki_base_url: "{{ lookup('env', 'MERAKI_BASE_URL') }}"
+    state: present
+    mode: "{{ item.mode }}"
+    hubs:
+      - hubId: "{{ item.hub_id }}"
+        useDefaultRoute: false
+      - hubId: "HUB_ID_SECONDARY"
+        useDefaultRoute: false
+    subnets:
+      - localSubnet: "10.{{ item.octet }}.24.0/24"    # Mgmt
+        useVpn: true
+      - localSubnet: "10.{{ item.octet }}.43.0/24"    # App
+        useVpn: true
+      - localSubnet: "10.{{ item.octet }}.36.0/24"    # Ops
+        useVpn: true
+      - localSubnet: "10.{{ item.octet }}.30.0/24"    # Devices
+        useVpn: false
+      - localSubnet: "10.{{ item.octet }}.54.0/24"    # General
+        useVpn: true
+      - localSubnet: "10.{{ item.octet }}.61.0/24"    # DMZ
+        useVpn: false
+      - localSubnet: "192.168.150.0/24"               # IoT
+        useVpn: false
+      - localSubnet: "192.168.160.0/24"               # VoiP
+        useVpn: false
+      - localSubnet: "192.168.170.0/24"               # Guest
+        useVpn: false
+      - localSubnet: "192.168.180.0/24"               # Security
+        useVpn: false
+      - localSubnet: "192.168.190.0/24"               # CCTV
+        useVpn: false
+  loop: "{{ network_info }}"
